@@ -12,7 +12,6 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import asyncio
 import logging
 import random
 import re
@@ -22,15 +21,17 @@ import numpy as np
 from common.constants import LLMType
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.llm_service import LLMBundle
-from api.db.services.user_service import TenantService
+from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, get_model_config_by_id, get_model_config_by_type_and_name
 from common.connection_utils import timeout
 from rag.flow.base import ProcessBase, ProcessParamBase
+from rag.flow.parser.pdf_chunk_metadata import finalize_pdf_chunk
 from rag.flow.tokenizer.schema import TokenizerFromUpstream
 from rag.nlp import rag_tokenizer
 from common import settings
 from rag.svr.task_executor import embed_limiter
 from common.token_utils import truncate
 
+from common.misc_utils import thread_pool_exec
 
 class TokenizerParam(ProcessParamBase):
     def __init__(self):
@@ -51,15 +52,21 @@ class Tokenizer(ProcessBase):
     component_name = "Tokenizer"
 
     async def _embedding(self, name, chunks):
+        # Tokenization may legitimately produce zero chunks; embedding should be a no-op.
+        if not chunks:
+            return [], 0
+
         parts = sum(["full_text" in self._param.search_method, "embedding" in self._param.search_method])
         token_count = 0
         if self._canvas._kb_id:
             e, kb = KnowledgebaseService.get_by_id(self._canvas._kb_id)
-            embedding_id = kb.embd_id
+            if kb.tenant_embd_id:
+                embd_model_config = get_model_config_by_id(kb.tenant_embd_id)
+            else:
+                embd_model_config = get_model_config_by_type_and_name(self._canvas._tenant_id, LLMType.EMBEDDING, kb.embd_id)
         else:
-            e, ten = TenantService.get_by_id(self._canvas._tenant_id)
-            embedding_id = ten.embd_id
-        embedding_model = LLMBundle(self._canvas._tenant_id, LLMType.EMBEDDING, llm_name=embedding_id)
+            embd_model_config = get_tenant_default_model_by_type(self._canvas._tenant_id, LLMType.EMBEDDING)
+        embedding_model = LLMBundle(self._canvas._tenant_id, embd_model_config)
         texts = []
         for c in chunks:
             txt = ""
@@ -84,7 +91,7 @@ class Tokenizer(ProcessBase):
         cnts_ = np.array([])
         for i in range(0, len(texts), settings.EMBEDDING_BATCH_SIZE):
             async with embed_limiter:
-                vts, c = await asyncio.to_thread(batch_encode,texts[i : i + settings.EMBEDDING_BATCH_SIZE],)
+                vts, c = await thread_pool_exec(batch_encode,texts[i : i + settings.EMBEDDING_BATCH_SIZE],)
             if len(cnts_) == 0:
                 cnts_ = vts
             else:
@@ -106,7 +113,8 @@ class Tokenizer(ProcessBase):
     async def _invoke(self, **kwargs):
         try:
             chunks = kwargs.get("chunks")
-            kwargs["chunks"] = [c for c in chunks if c is not None]
+            if chunks is not None:
+                kwargs["chunks"] = [c for c in chunks if c is not None]
 
             from_upstream = TokenizerFromUpstream.model_validate(kwargs)
         except Exception as e:
@@ -117,9 +125,11 @@ class Tokenizer(ProcessBase):
         parts = sum(["full_text" in self._param.search_method, "embedding" in self._param.search_method])
         if "full_text" in self._param.search_method:
             self.callback(random.randint(1, 5) / 100.0, "Start to tokenize.")
-            if from_upstream.chunks:
-                chunks = from_upstream.chunks
+            # Branch on the declared upstream format so an empty chunk list stays on the chunk path.
+            if from_upstream.output_format == "chunks":
+                chunks = from_upstream.chunks or []
                 for i, ck in enumerate(chunks):
+                    ck["chunk_order_int"] = i
                     ck["title_tks"] = rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", from_upstream.name))
                     ck["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(ck["title_tks"])
                     if ck.get("questions"):
@@ -156,7 +166,8 @@ class Tokenizer(ProcessBase):
                     ck["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(ck["content_ltks"])
                 chunks = [ck]
             else:
-                chunks = from_upstream.json_result
+                # Empty JSON payloads are valid and should remain empty downstream.
+                chunks = from_upstream.json_result or []
                 for i, ck in enumerate(chunks):
                     ck["title_tks"] = rag_tokenizer.tokenize(re.sub(r"\.[a-zA-Z]+$", "", from_upstream.name))
                     ck["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(ck["title_tks"])
@@ -179,5 +190,7 @@ class Tokenizer(ProcessBase):
             self.set_output("embedding_token_consumption", token_count)
 
             self.callback(1.0, "Finish embedding.")
+
+        chunks = [finalize_pdf_chunk(ck) for ck in chunks]
 
         self.set_output("chunks", chunks)

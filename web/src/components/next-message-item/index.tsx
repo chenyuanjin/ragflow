@@ -1,4 +1,3 @@
-import { ReactComponent as AssistantIcon } from '@/assets/svg/assistant.svg';
 import { MessageType } from '@/constants/chat';
 import {
   IMessage,
@@ -22,27 +21,24 @@ import { INodeEvent, MessageEventType } from '@/hooks/use-send-message';
 import { cn } from '@/lib/utils';
 import { AgentChatContext } from '@/pages/agent/context';
 import { WorkFlowTimeline } from '@/pages/agent/log-sheet/workflow-timeline';
+import { citationMarkerReg } from '@/utils/citation-utils';
+import { getDirAttribute } from '@/utils/text-direction';
 import { isEmpty } from 'lodash';
 import { Atom, ChevronDown, ChevronUp } from 'lucide-react';
+import { DocumentDownloadButton } from '../document-download-button';
 import MarkdownContent from '../next-markdown-content';
-import {
-  PDFDownloadButton,
-  extractPDFDownloadInfo,
-  removePDFDownloadInfo,
-} from '../pdf-download-button';
 import { RAGFlowAvatar } from '../ragflow-avatar';
+import SvgIcon from '../svg-icon';
 import { useTheme } from '../theme-provider';
 import { Button } from '../ui/button';
 import { AssistantGroupButton, UserGroupButton } from './group-button';
-import styles from './index.less';
+import styles from './index.module.less';
 import { ReferenceDocumentList } from './reference-document-list';
 import { ReferenceImageList } from './reference-image-list';
 import { UploadedMessageFiles } from './uploaded-message-files';
 
 interface IProps
-  extends Partial<IRemoveMessageById>,
-    IRegenerateMessage,
-    PropsWithChildren {
+  extends Partial<IRemoveMessageById>, IRegenerateMessage, PropsWithChildren {
   item: IMessage;
   conversationId?: string;
   currentEventListWithoutMessageById?: (messageId: string) => INodeEvent[];
@@ -102,19 +98,11 @@ function MessageItem({
     return Object.values(docs);
   }, [reference?.doc_aggs]);
 
-  // Extract PDF download info from message content
-  const pdfDownloadInfo = useMemo(
-    () => extractPDFDownloadInfo(item.content),
-    [item.content],
+  const documentDownloadInfos = useMemo(
+    () => item.downloads ?? [],
+    [item.downloads],
   );
-
-  // If we have PDF download info, extract the remaining text
-  const messageContent = useMemo(() => {
-    if (!pdfDownloadInfo) return item.content;
-
-    // Remove the JSON part from the content to avoid showing it
-    return removePDFDownloadInfo(item.content, pdfDownloadInfo);
-  }, [item.content, pdfDownloadInfo]);
+  const messageContent = item.content;
 
   const handleRegenerateMessage = useCallback(() => {
     regenerateMessage?.(item);
@@ -137,9 +125,7 @@ function MessageItem({
   );
 
   const renderContent = useCallback(() => {
-    /* Show message content if there's any text besides the download */
-
-    if (pdfDownloadInfo) {
+    if (!messageContent && !(item.data || (sendLoading && !isShare))) {
       return null;
     }
 
@@ -151,6 +137,7 @@ function MessageItem({
           [styles.messageUserText]: !isAssistant,
           'bg-bg-card': !isAssistant,
         })}
+        dir={getDirAttribute(messageContent.replace(citationMarkerReg, ''))}
       >
         {item.data ? (
           children
@@ -174,7 +161,6 @@ function MessageItem({
     item.data,
     loading,
     messageContent,
-    pdfDownloadInfo,
     reference,
     sendLoading,
     theme,
@@ -208,7 +194,11 @@ function MessageItem({
                 isPerson
               />
             ) : (
-              <AssistantIcon />
+              <SvgIcon
+                name={'assistant'}
+                width={'100%'}
+                className={cn('size-10 fill-current')}
+              ></SvgIcon>
             ))}
           <section className="flex-col gap-2 flex-1">
             <div className="flex justify-between items-center">
@@ -234,19 +224,20 @@ function MessageItem({
                     {isShare && !sendLoading && !isEmpty(item.content) && (
                       <AssistantGroupButton
                         messageId={item.id}
-                        content={item.content}
+                        content={messageContent}
                         prompt={item.prompt}
                         showLikeButton={showLikeButton}
                         audioBinary={item.audio_binary}
                         showLoudspeaker={showLoudspeaker}
                         showLog={showLog}
                         attachment={item.attachment}
+                        isShare={isShare}
                       ></AssistantGroupButton>
                     )}
                     {!isShare && (
                       <AssistantGroupButton
                         messageId={item.id}
-                        content={item.content}
+                        content={messageContent}
                         prompt={item.prompt}
                         showLikeButton={showLikeButton}
                         audioBinary={item.audio_binary}
@@ -258,7 +249,7 @@ function MessageItem({
                   </>
                 ) : (
                   <UserGroupButton
-                    content={item.content}
+                    content={messageContent}
                     messageId={item.id}
                     removeMessageById={removeMessageById}
                     regenerateMessage={
@@ -286,14 +277,6 @@ function MessageItem({
                 </div>
               )}
 
-            {/* Show PDF download button if download info is present */}
-            {pdfDownloadInfo && (
-              <PDFDownloadButton
-                downloadInfo={pdfDownloadInfo}
-                className="mb-2"
-              />
-            )}
-
             {renderContent()}
 
             {isAssistant && (
@@ -313,6 +296,16 @@ function MessageItem({
               <UploadedMessageFiles
                 files={item.files as File[] | UploadResponseDataType[]}
               ></UploadedMessageFiles>
+            )}
+            {documentDownloadInfos.length > 0 && (
+              <div className="mt-3 space-y-3">
+                {documentDownloadInfos.map((downloadInfo, index) => (
+                  <div key={`${downloadInfo.filename}-${index}`}>
+                    {index > 0 && <div className="my-6 h-px bg-border" />}
+                    <DocumentDownloadButton downloadInfo={downloadInfo} />
+                  </div>
+                ))}
+              </div>
             )}
             {/* {isAssistant && item.attachment && item.attachment.doc_id && (
               <div className="w-full flex items-center justify-end">

@@ -8,10 +8,11 @@ import re
 from datetime import datetime, timedelta
 from datetime import timezone
 from email.message import Message
-from email.utils import collapse_rfc2231_value, parseaddr
+from email.utils import collapse_rfc2231_value, getaddresses
 from enum import Enum
 from typing import Any
 from typing import cast
+import uuid
 
 import bs4
 from pydantic import BaseModel
@@ -616,9 +617,9 @@ def _sanitize_mailbox_names(mailboxes: list[str]) -> list[str]:
 
 
 def _parse_addrs(raw_header: str) -> list[tuple[str, str]]:
-    addrs = raw_header.split(",")
-    name_addr_pairs = [parseaddr(addr=addr) for addr in addrs if addr]
-    return [(name, addr) for name, addr in name_addr_pairs if addr]
+    if not raw_header:
+        return []
+    return getaddresses([raw_header])
 
 
 def _parse_singular_addr(raw_header: str) -> tuple[str, str]:
@@ -635,7 +636,6 @@ def _parse_singular_addr(raw_header: str) -> tuple[str, str]:
 
 if __name__ == "__main__":
     import time
-    import uuid
     from types import TracebackType
     from common.data_source.utils import load_all_docs_from_checkpoint_connector
 

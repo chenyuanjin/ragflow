@@ -9,7 +9,7 @@ import { useIsFetching } from '@tanstack/react-query';
 import { pick } from 'lodash';
 import { useCallback, useEffect, useState } from 'react';
 import { UseFormReturn } from 'react-hook-form';
-import { useParams, useSearchParams } from 'umi';
+import { useParams, useSearchParams } from 'react-router';
 import { z } from 'zod';
 import { formSchema } from './form-schema';
 
@@ -35,7 +35,7 @@ export function useHasParsedDocument(isEdit?: boolean) {
 }
 
 export const useFetchKnowledgeConfigurationOnMount = (
-  form: UseFormReturn<z.infer<typeof formSchema>, any, undefined>,
+  form: UseFormReturn<z.infer<typeof formSchema>>,
 ) => {
   const { data: knowledgeDetails, loading } =
     useFetchKnowledgeBaseConfiguration();
@@ -60,14 +60,14 @@ export const useFetchKnowledgeConfigurationOnMount = (
         'description',
         'name',
         'permission',
-        'embd_id',
-        'parser_id',
         'language',
         'parser_config',
         'connectors',
         'pagerank',
         'avatar',
       ]),
+      embedding_model: knowledgeDetails.embd_id,
+      chunk_method: knowledgeDetails.parser_id,
     } as z.infer<typeof formSchema>;
     form.reset(formValues);
   }, [form, knowledgeDetails]);

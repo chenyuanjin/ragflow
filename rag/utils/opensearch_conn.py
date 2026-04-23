@@ -34,6 +34,30 @@ from common import settings
 
 ATTEMPT_TIME = 2
 
+_PAGERANK_FEA_ADJUST_SCRIPT = """
+double cur = 0.0;
+if (ctx._source.containsKey(params.pf)) {
+  Object v = ctx._source[params.pf];
+  if (v != null) {
+    if (v instanceof Number) {
+      cur = ((Number)v).doubleValue();
+    } else {
+      try { cur = Double.parseDouble(v.toString()); } catch (Exception e) { cur = 0.0; }
+    }
+  }
+}
+double nw = cur + params.delta;
+if (nw < params.min_w) { nw = params.min_w; }
+if (nw > params.max_w) { nw = params.max_w; }
+if (nw <= 0.0) {
+  if (ctx._source.containsKey(params.pf)) {
+    ctx._source.remove(params.pf);
+  }
+} else {
+  ctx._source[params.pf] = nw;
+}
+"""
+
 logger = logging.getLogger('ragflow.opensearch_conn')
 
 
@@ -72,7 +96,8 @@ class OSConnection(DocStoreConnection):
             msg = f"OpenSearch mapping file not found at {fp_mapping}"
             logger.error(msg)
             raise Exception(msg)
-        self.mapping = json.load(open(fp_mapping, "r"))
+        with open(fp_mapping, "r") as f:
+            self.mapping = json.load(f)
         logger.info(f"OpenSearch {settings.OS['hosts']} is healthy.")
 
     """
@@ -91,7 +116,7 @@ class OSConnection(DocStoreConnection):
     Table operations
     """
 
-    def create_idx(self, indexName: str, knowledgebaseId: str, vectorSize: int):
+    def create_idx(self, indexName: str, knowledgebaseId: str, vectorSize: int, parser_id: str = None):
         if self.index_exist(indexName, knowledgebaseId):
             return True
         try:
@@ -328,9 +353,37 @@ class OSConnection(DocStoreConnection):
             # update specific single document
             chunkId = condition["id"]
             for i in range(ATTEMPT_TIME):
+                doc_part = copy.deepcopy(doc)
+                remove_value = doc_part.pop("remove", None)
+                remove_field = remove_value if isinstance(remove_value, str) else None
+                remove_dict = remove_value if isinstance(remove_value, dict) else None
                 try:
-                    self.os.update(index=indexName, id=chunkId, body={"doc": doc})
-                    return True
+                    if remove_field is not None:
+                        self.os.update(
+                            index=indexName,
+                            id=chunkId,
+                            body={"script": {"source": f"ctx._source.remove('{remove_field}');"}},
+                        )
+                    if remove_dict is not None:
+                        scripts = []
+                        params = {}
+                        for kk, vv in remove_dict.items():
+                            scripts.append(
+                                f"if (ctx._source.containsKey('{kk}') && ctx._source.{kk} != null) "
+                                f"{{ int i = ctx._source.{kk}.indexOf(params.p_{kk}); "
+                                f"if (i >= 0) {{ ctx._source.{kk}.remove(i); }} }}"
+                            )
+                            params[f"p_{kk}"] = vv
+                        if scripts:
+                            self.os.update(
+                                index=indexName,
+                                id=chunkId,
+                                body={"script": {"source": "".join(scripts), "params": params}},
+                            )
+                    if doc_part:
+                        self.os.update(index=indexName, id=chunkId, body={"doc": doc_part})
+                    if remove_field is not None or remove_dict is not None or doc_part:
+                        return True
                 except Exception as e:
                     logger.exception(
                         f"OSConnection.update(index={indexName}, id={id}, doc={json.dumps(condition, ensure_ascii=False)}) got exception")
@@ -404,35 +457,92 @@ class OSConnection(DocStoreConnection):
                 break
         return False
 
+    def adjust_chunk_pagerank_fea(
+        self,
+        chunk_id: str,
+        indexName: str,
+        knowledgebaseId: str,
+        delta: float,
+        min_w: float = 0.0,
+        max_w: float = 100.0,
+        row_id: int | None = None,
+    ) -> bool:
+        """Atomically adjust pagerank_fea on one chunk (painless script)."""
+        _ = row_id
+        try:
+            self.os.update(
+                index=indexName,
+                id=chunk_id,
+                retry_on_conflict=3,
+                body={
+                    "script": {
+                        "source": _PAGERANK_FEA_ADJUST_SCRIPT.strip(),
+                        "lang": "painless",
+                        "params": {
+                            "pf": PAGERANK_FLD,
+                            "delta": float(delta),
+                            "min_w": float(min_w),
+                            "max_w": float(max_w),
+                        },
+                    }
+                },
+            )
+            logger.debug(
+                "OSConnection.adjust_chunk_pagerank_fea(index=%s, id=%s, delta=%s) succeeded",
+                indexName,
+                chunk_id,
+                delta,
+            )
+            return True
+        except Exception as e:
+            logger.exception(
+                "OSConnection.adjust_chunk_pagerank_fea(index=%s, id=%s): %s",
+                indexName,
+                chunk_id,
+                e,
+            )
+        return False
+
     def delete(self, condition: dict, indexName: str, knowledgebaseId: str) -> int:
-        qry = None
         assert "_id" not in condition
+        condition["kb_id"] = knowledgebaseId
+
+        # Build a bool query that combines id filter with other conditions
+        bool_query = Q("bool")
+
+        # Handle chunk IDs if present
         if "id" in condition:
             chunk_ids = condition["id"]
             if not isinstance(chunk_ids, list):
                 chunk_ids = [chunk_ids]
-            if not chunk_ids:  # when chunk_ids is empty, delete all
-                qry = Q("match_all")
-            else:
-                qry = Q("ids", values=chunk_ids)
+            if chunk_ids:
+                # Filter by specific chunk IDs
+                bool_query.filter.append(Q("ids", values=chunk_ids))
+            # If chunk_ids is empty, we don't add an ids filter - rely on other conditions
+
+        # Add all other conditions as filters
+        for k, v in condition.items():
+            if k == "id":
+                continue  # Already handled above
+            if k == "exists":
+                bool_query.filter.append(Q("exists", field=v))
+            elif k == "must_not":
+                if isinstance(v, dict):
+                    for kk, vv in v.items():
+                        if kk == "exists":
+                            bool_query.must_not.append(Q("exists", field=vv))
+            elif isinstance(v, list):
+                bool_query.must.append(Q("terms", **{k: v}))
+            elif isinstance(v, str) or isinstance(v, int):
+                bool_query.must.append(Q("term", **{k: v}))
+            elif v is not None:
+                raise Exception("Condition value must be int, str or list.")
+
+        # If no filters were added, use match_all (for tenant-wide operations)
+        if not bool_query.filter and not bool_query.must and not bool_query.must_not:
+            qry = Q("match_all")
         else:
-            qry = Q("bool")
-            for k, v in condition.items():
-                if k == "exists":
-                    qry.filter.append(Q("exists", field=v))
-
-                elif k == "must_not":
-                    if isinstance(v, dict):
-                        for kk, vv in v.items():
-                            if kk == "exists":
-                                qry.must_not.append(Q("exists", field=vv))
-
-                elif isinstance(v, list):
-                    qry.must.append(Q("terms", **{k: v}))
-                elif isinstance(v, str) or isinstance(v, int):
-                    qry.must.append(Q("term", **{k: v}))
-                else:
-                    raise Exception("Condition value must be int, str or list.")
+            qry = bool_query
         logger.debug("OSConnection.delete query: " + json.dumps(qry.to_dict()))
         for _ in range(ATTEMPT_TIME):
             try:

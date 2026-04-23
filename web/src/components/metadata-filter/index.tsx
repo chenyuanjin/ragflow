@@ -22,11 +22,21 @@ export const MetadataFilterSchema = {
           z.object({
             key: z.string(),
             op: z.string(),
-            value: z.string(),
+            value: z.union([z.string(), z.array(z.string())]),
           }),
         )
         .optional(),
-      semi_auto: z.array(z.string()).optional(),
+      semi_auto: z
+        .array(
+          z.union([
+            z.string(),
+            z.object({
+              key: z.string(),
+              op: z.string().optional(),
+            }),
+          ]),
+        )
+        .optional(),
     })
     .optional(),
 };
@@ -42,7 +52,7 @@ export function MetadataFilter({
 
   const kbIds: string[] = useWatch({
     control: form.control,
-    name: prefix + 'kb_ids',
+    name: prefix + 'dataset_ids',
   });
   const metadata = useWatch({
     control: form.control,

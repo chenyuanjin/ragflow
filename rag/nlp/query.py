@@ -41,8 +41,14 @@ class FulltextQueryer(QueryBase):
     def question(self, txt, tbl="qa", min_match: float = 0.6):
         original_query = txt
         txt = self.add_space_between_eng_zh(txt)
+
+        # Strip Infinity ESCAPABLE characters from the query.
+        #
+        # Infinity's search_lexer.l defines ESCAPABLE characters [\x20()^"'~*?:\\]
+        # If these characters appear unescaped in a query, Infinity's lexer will
+        # interpret them as special tokens, causing parsing errors.
         txt = re.sub(
-            r"[ :|\r\n\t,，。？?/`!！&^%%()\[\]{}<>]+",
+            r"[ :|\r\n\t,，。？?/`!！&^%%()\[\]{}<>*~'\"\\]+",
             " ",
             rag_tokenizer.tradi2simp(rag_tokenizer.strQ2B(txt.lower())),
         ).strip()
@@ -55,13 +61,13 @@ class FulltextQueryer(QueryBase):
             keywords = [t for t in tks if t]
             tks_w = self.tw.weights(tks, preprocess=False)
             tks_w = [(re.sub(r"[ \\\"'^]", "", tk), w) for tk, w in tks_w]
-            tks_w = [(re.sub(r"^[a-z0-9]$", "", tk), w) for tk, w in tks_w if tk]
             tks_w = [(re.sub(r"^[\+-]", "", tk), w) for tk, w in tks_w if tk]
             tks_w = [(tk.strip(), w) for tk, w in tks_w if tk.strip()]
             syns = []
             for tk, w in tks_w[:256]:
-                syn = self.syn.lookup(tk)
-                syn = rag_tokenizer.tokenize(" ".join(syn)).split()
+                # Strip single quotes from synonym terms to avoid Infinity lexer TokenError
+                # (e.g. WordNet returns "cat-o'-nine-tails" for "cat")
+                syn = [rag_tokenizer.tokenize(s).replace("'", "") for s in self.syn.lookup(tk)]
                 keywords.extend(syn)
                 syn = ["\"{}\"^{:.4f}".format(s, w / 4.) for s in syn if s.strip()]
                 syns.append(" ".join(syn))
@@ -190,7 +196,10 @@ class FulltextQueryer(QueryBase):
             d = defaultdict(int)
             wts = self.tw.weights(tks, preprocess=False)
             for i, (t, c) in enumerate(wts):
-                d[t] += c
+                d[t] += c * 0.4
+                if i+1 < len(wts):
+                    _t, _c = wts[i+1]
+                    d[t+_t] += max(c, _c) * 0.6
             return d
 
         atks = to_dict(atks)
@@ -232,5 +241,5 @@ class FulltextQueryer(QueryBase):
                 keywords.append(f"{tk}^{w}")
 
         return MatchTextExpr(self.query_fields, " ".join(keywords), 100,
-                             {"minimum_should_match": min(3, len(keywords) / 10),
+                             {"minimum_should_match": min(3, round(len(keywords) / 10)),
                               "original_query": " ".join(origin_keywords)})

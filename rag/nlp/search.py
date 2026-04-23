@@ -13,7 +13,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-import asyncio
 import json
 import logging
 import re
@@ -21,15 +20,16 @@ import math
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 
-from rag.prompts.generator import relevant_chunks_with_toc
 from rag.nlp import rag_tokenizer, query
 import numpy as np
 from common.doc_store.doc_store_base import MatchDenseExpr, FusionExpr, OrderByExpr, DocStoreConnection
 from common.string_utils import remove_redundant_spaces
 from common.float_utils import get_float
 from common.constants import PAGERANK_FLD, TAG_FLD
+from common.tag_feature_utils import parse_tag_features
 from common import settings
 
+from common.misc_utils import thread_pool_exec
 
 def index_name(uid): return f"ragflow_{uid}"
 
@@ -50,8 +50,8 @@ class Dealer:
         keywords: list[str] | None = None
         group_docs: list[list] | None = None
 
-    def get_vector(self, txt, emb_mdl, topk=10, similarity=0.1):
-        qv, _ = emb_mdl.encode_queries(txt)
+    async def get_vector(self, txt, emb_mdl, topk=10, similarity=0.1):
+        qv, _ = await thread_pool_exec(emb_mdl.encode_queries, txt)
         shape = np.array(qv).shape
         if len(shape) > 1:
             raise Exception(
@@ -72,7 +72,7 @@ class Dealer:
                 condition[key] = req[key]
         return condition
 
-    def search(self, req, idx_names: str | list[str],
+    async def search(self, req, idx_names: str | list[str],
                kb_ids: list[str],
                emb_mdl=None,
                highlight: bool | list | None = None,
@@ -91,15 +91,16 @@ class Dealer:
 
         src = req.get("fields",
                       ["docnm_kwd", "content_ltks", "kb_id", "img_id", "title_tks", "important_kwd", "position_int",
-                       "doc_id", "page_num_int", "top_int", "create_timestamp_flt", "knowledge_graph_kwd",
+                       "doc_id", "chunk_order_int", "page_num_int", "top_int", "create_timestamp_flt", "knowledge_graph_kwd",
                        "question_kwd", "question_tks", "doc_type_kwd",
-                       "available_int", "content_with_weight", "mom_id", PAGERANK_FLD, TAG_FLD])
+                       "available_int", "content_with_weight", "mom_id", PAGERANK_FLD, TAG_FLD, "row_id()"])
         kwds = set([])
 
         qst = req.get("question", "")
         q_vec = []
         if not qst:
             if req.get("sort"):
+                orderBy.asc("chunk_order_int")
                 orderBy.asc("page_num_int")
                 orderBy.asc("top_int")
                 orderBy.desc("create_timestamp_flt")
@@ -115,12 +116,12 @@ class Dealer:
             matchText, keywords = self.qryr.question(qst, min_match=0.3)
             if emb_mdl is None:
                 matchExprs = [matchText]
-                res = self.dataStore.search(src, highlightFields, filters, matchExprs, orderBy, offset, limit,
+                res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
                                             idx_names, kb_ids, rank_feature=rank_feature)
                 total = self.dataStore.get_total(res)
                 logging.debug("Dealer.search TOTAL: {}".format(total))
             else:
-                matchDense = self.get_vector(qst, emb_mdl, topk, req.get("similarity", 0.1))
+                matchDense = await self.get_vector(qst, emb_mdl, topk, req.get("similarity", 0.1))
                 q_vec = matchDense.embedding_data
                 if not settings.DOC_ENGINE_INFINITY:
                     src.append(f"q_{len(q_vec)}_vec")
@@ -128,7 +129,7 @@ class Dealer:
                 fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05,0.95"})
                 matchExprs = [matchText, matchDense, fusionExpr]
 
-                res = self.dataStore.search(src, highlightFields, filters, matchExprs, orderBy, offset, limit,
+                res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit,
                                             idx_names, kb_ids, rank_feature=rank_feature)
                 total = self.dataStore.get_total(res)
                 logging.debug("Dealer.search TOTAL: {}".format(total))
@@ -136,12 +137,12 @@ class Dealer:
                 # If result is empty, try again with lower min_match
                 if total == 0:
                     if filters.get("doc_id"):
-                        res = self.dataStore.search(src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
+                        res = await thread_pool_exec(self.dataStore.search, src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
                         total = self.dataStore.get_total(res)
                     else:
                         matchText, _ = self.qryr.question(qst, min_match=0.1)
                         matchDense.extra_options["similarity"] = 0.17
-                        res = self.dataStore.search(src, highlightFields, filters, [matchText, matchDense, fusionExpr],
+                        res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, [matchText, matchDense, fusionExpr],
                                                     orderBy, offset, limit, idx_names, kb_ids,
                                                     rank_feature=rank_feature)
                         total = self.dataStore.get_total(res)
@@ -194,16 +195,18 @@ class Dealer:
                         i += 1
                     pieces_.append("".join(pieces[st: i]) + "\n")
                 else:
+                    # Sentence boundary regex includes Arabic punctuation (، ؛ ؟ ۔)
                     pieces_.extend(
                         re.split(
-                            r"([^\|][；。？!！\n]|[a-z][.?;!][ \n])",
+                            r"([^\|][；。？!！،؛؟۔\n]|[a-z\u0600-\u06FF][.?;!،؛؟][ \n])",
                             pieces[i]))
                     i += 1
             pieces = pieces_
         else:
-            pieces = re.split(r"([^\|][；。？!！\n]|[a-z][.?;!][ \n])", answer)
+            # Sentence boundary regex includes Arabic punctuation (، ؛ ؟ ۔)
+            pieces = re.split(r"([^\|][；。？!！،؛؟۔\n]|[a-z\u0600-\u06FF][.?;!،؛؟][ \n])", answer)
         for i in range(1, len(pieces)):
-            if re.match(r"([^\|][；。？!！\n]|[a-z][.?;!][ \n])", pieces[i]):
+            if re.match(r"([^\|][；。？!！،؛؟۔\n]|[a-z\u0600-\u06FF][.?;!،؛؟][ \n])", pieces[i]):
                 pieces[i - 1] += pieces[i][0]
                 pieces[i] = pieces[i][1:]
         idx = []
@@ -277,12 +280,18 @@ class Dealer:
             return np.array([0 for _ in range(len(search_res.ids))]) + pageranks
 
         q_denor = np.sqrt(np.sum([s * s for t, s in query_rfea.items() if t != PAGERANK_FLD]))
+        if q_denor == 0:
+            return np.array([0 for _ in range(len(search_res.ids))]) + pageranks
         for i in search_res.ids:
             nor, denor = 0, 0
             if not search_res.field[i].get(TAG_FLD):
                 rank_fea.append(0)
                 continue
-            for t, sc in eval(search_res.field[i].get(TAG_FLD, "{}")).items():
+            tag_feas = parse_tag_features(search_res.field[i].get(TAG_FLD), allow_json_string=True, allow_python_literal=True)
+            if not tag_feas:
+                rank_fea.append(0)
+                continue
+            for t, sc in tag_feas.items():
                 if t in query_rfea:
                     nor += query_rfea[t] * sc
                 denor += sc * sc
@@ -360,7 +369,7 @@ class Dealer:
                                            rag_tokenizer.tokenize(ans).split(),
                                            rag_tokenizer.tokenize(inst).split())
 
-    def retrieval(
+    async def retrieval(
             self,
             question,
             embd_mdl,
@@ -381,12 +390,18 @@ class Dealer:
         if not question:
             return ranks
 
-        # Ensure RERANK_LIMIT is multiple of page_size
+        # Keep the historical windowing strategy by default, but when an external
+        # reranker is enabled cap candidate count by both top_k and provider-safe 64.
         RERANK_LIMIT = math.ceil(64 / page_size) * page_size if page_size > 1 else 1
+        RERANK_LIMIT = max(30, RERANK_LIMIT)
+        if rerank_mdl and top > 0:
+            RERANK_LIMIT = min(RERANK_LIMIT, top, 64)
+        page = max(page, 1)
+        global_offset = (page - 1) * page_size
         req = {
             "kb_ids": kb_ids,
             "doc_ids": doc_ids,
-            "page": math.ceil(page_size * page / RERANK_LIMIT),
+            "page": global_offset // RERANK_LIMIT + 1,
             "size": RERANK_LIMIT,
             "question": question,
             "vector": True,
@@ -398,7 +413,7 @@ class Dealer:
         if isinstance(tenant_ids, str):
             tenant_ids = tenant_ids.split(",")
 
-        sres = self.search(req, [index_name(tid) for tid in tenant_ids], kb_ids, embd_mdl, highlight,
+        sres = await self.search(req, [index_name(tid) for tid in tenant_ids], kb_ids, embd_mdl, highlight,
                            rank_feature=rank_feature)
 
         if rerank_mdl and sres.total > 0:
@@ -434,7 +449,15 @@ class Dealer:
 
         sorted_idx = np.argsort(sim_np * -1)
 
-        valid_idx = [int(i) for i in sorted_idx if sim_np[i] >= similarity_threshold]
+        # When vector_similarity_weight is 0, similarity_threshold is not meaningful for term-only scores.
+        post_threshold = 0.0 if vector_similarity_weight <= 0 else similarity_threshold
+
+        # When doc_ids is explicitly provided (metadata or document filtering), bypass threshold
+        # User wants those specific documents regardless of their relevance score
+        if doc_ids:
+            post_threshold = 0.0
+
+        valid_idx = [int(i) for i in sorted_idx if sim_np[i] >= post_threshold]
         filtered_count = len(valid_idx)
         ranks["total"] = int(filtered_count)
 
@@ -442,9 +465,7 @@ class Dealer:
             ranks["doc_aggs"] = []
             return ranks
 
-        max_pages = max(RERANK_LIMIT // max(page_size, 1), 1)
-        page_index = (page - 1) % max_pages
-        begin = page_index * page_size
+        begin = global_offset % RERANK_LIMIT
         end = begin + page_size
         page_idx = valid_idx[begin:end]
 
@@ -467,6 +488,7 @@ class Dealer:
                 "docnm_kwd": dnm,
                 "kb_id": chunk["kb_id"],
                 "important_kwd": chunk.get("important_kwd", []),
+                "tag_kwd": chunk.get("tag_kwd", []),
                 "image_id": chunk.get("img_id", ""),
                 "similarity": float(sim_np[i]),
                 "vector_similarity": float(vsim[i]),
@@ -475,6 +497,7 @@ class Dealer:
                 "positions": position_int,
                 "doc_type_kwd": chunk.get("doc_type_kwd", ""),
                 "mom_id": chunk.get("mom_id", ""),
+                "row_id": chunk.get("row_id()"),
             }
             if highlight and sres.highlight:
                 if id in sres.highlight:
@@ -536,15 +559,18 @@ class Dealer:
         res = []
         bs = 128
         for p in range(offset, max_count, bs):
-            es_res = self.dataStore.search(fields, [], condition, [], orderBy, p, bs, index_name(tenant_id),
+            limit = min(bs, max_count - p)
+            if limit <= 0:
+                break
+            es_res = self.dataStore.search(fields, [], condition, [], orderBy, p, limit, index_name(tenant_id),
                                            kb_ids)
             dict_chunks = self.dataStore.get_fields(es_res, fields)
             for id, doc in dict_chunks.items():
                 doc["id"] = id
             if dict_chunks:
                 res.extend(dict_chunks.values())
-            # FIX: Solo terminar si no hay chunks, no si hay menos de bs
-            if len(dict_chunks.values()) == 0:
+            chunk_count = len(dict_chunks)
+            if chunk_count == 0 or chunk_count < limit:
                 break
         return res
 
@@ -589,7 +615,8 @@ class Dealer:
                          key=lambda x: x[1] * -1)[:topn_tags]
         return {a.replace(".", "_"): max(1, c) for a, c in tag_fea}
 
-    def retrieval_by_toc(self, query: str, chunks: list[dict], tenant_ids: list[str], chat_mdl, topn: int = 6):
+    async def retrieval_by_toc(self, query: str, chunks: list[dict], tenant_ids: list[str], chat_mdl, topn: int = 6):
+        from rag.prompts.generator import relevant_chunks_with_toc # moved from the top of the file to avoid circular import
         if not chunks:
             return []
         idx_nms = [index_name(tid) for tid in tenant_ids]
@@ -614,7 +641,7 @@ class Dealer:
         if not toc:
             return chunks
 
-        ids = asyncio.run(relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2))
+        ids = await relevant_chunks_with_toc(query, toc, chat_mdl, topn * 2)
         if not ids:
             return chunks
 
@@ -624,7 +651,7 @@ class Dealer:
             if cid in id2idx:
                 chunks[id2idx[cid]]["similarity"] += sim
                 continue
-            chunk = self.dataStore.get(cid, idx_nms, kb_ids)
+            chunk = self.dataStore.get(cid, idx_nms[0], kb_ids)
             if not chunk:
                 continue
             d = {
@@ -674,7 +701,7 @@ class Dealer:
 
         vector_size = 1024
         for id, cks in mom_chunks.items():
-            chunk = self.dataStore.get(id, idx_nms, [ck["kb_id"] for ck in cks])
+            chunk = self.dataStore.get(id, idx_nms[0], [ck["kb_id"] for ck in cks])
             d = {
                 "chunk_id": id,
                 "content_ltks": " ".join([ck["content_ltks"] for ck in cks]),

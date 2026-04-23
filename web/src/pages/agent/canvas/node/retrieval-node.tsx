@@ -2,7 +2,7 @@ import { NodeCollapsible } from '@/components/collapse';
 import { RAGFlowAvatar } from '@/components/ragflow-avatar';
 import { useFetchKnowledgeList } from '@/hooks/use-knowledge-request';
 import { useFetchAllMemoryList } from '@/hooks/use-memory-request';
-import { BaseNode } from '@/interfaces/database/flow';
+import { BaseNode } from '@/interfaces/database/agent';
 import { NodeProps, Position } from '@xyflow/react';
 import classNames from 'classnames';
 import { get } from 'lodash';
@@ -12,7 +12,7 @@ import { RetrievalFormSchemaType } from '../../form/retrieval-form/next';
 import { useGetVariableLabelOrTypeByValue } from '../../hooks/use-get-begin-query';
 import { LabelCard } from './card';
 import { CommonHandle, LeftEndHandle } from './handle';
-import styles from './index.less';
+import styles from './index.module.less';
 import NodeHeader from './node-header';
 import { NodeWrapper } from './node-wrapper';
 import { ToolBar } from './toolbar';
@@ -23,7 +23,7 @@ function InnerRetrievalNode({
   isConnectable = true,
   selected,
 }: NodeProps<BaseNode<RetrievalFormSchemaType>>) {
-  const knowledgeBaseIds: string[] = get(data, 'form.kb_ids', []);
+  const knowledgeBaseIds: string[] = get(data, 'form.dataset_ids', []);
   const memoryIds: string[] = get(data, 'form.memory_ids', []);
   const { list: knowledgeList } = useFetchKnowledgeList(true);
 

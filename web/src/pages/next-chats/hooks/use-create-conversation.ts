@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import { useParams } from 'umi';
+import { useParams } from 'react-router';
 import { useChatUrlParams } from './use-chat-url';
 import { useSetConversation } from './use-set-conversation';
 
@@ -12,7 +12,7 @@ export const useCreateConversationBeforeUploadDocument = () => {
     async (message: string) => {
       const isNew = getIsNew();
       if (isNew === 'true') {
-        const data = await setConversation(message, true);
+        const data = await setConversation(message);
 
         return data;
       }

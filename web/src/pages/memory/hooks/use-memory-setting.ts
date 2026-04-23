@@ -2,7 +2,7 @@ import { useHandleSearchChange } from '@/hooks/logic-hooks';
 import { IMemory } from '@/pages/memories/interface';
 import memoryService from '@/services/memory-service';
 import { useQuery } from '@tanstack/react-query';
-import { useParams, useSearchParams } from 'umi';
+import { useParams, useSearchParams } from 'react-router';
 import { MemoryApiAction } from '../constant';
 
 export const useFetchMemoryBaseConfiguration = () => {
@@ -12,7 +12,7 @@ export const useFetchMemoryBaseConfiguration = () => {
   const { handleInputChange, searchString, pagination, setPagination } =
     useHandleSearchChange();
 
-  let queryKey: (MemoryApiAction | number)[] = [
+  const queryKey: (MemoryApiAction | number)[] = [
     MemoryApiAction.FetchMemoryDetail,
   ];
 

@@ -14,7 +14,7 @@
 #  limitations under the License.
 #
 import pytest
-from common import (
+from test_common import (
     detail_kb,
 )
 from configs import INVALID_API_TOKEN
@@ -22,7 +22,7 @@ from libs.auth import RAGFlowWebApiAuth
 
 
 class TestAuthorization:
-    @pytest.mark.p1
+    @pytest.mark.p2
     @pytest.mark.parametrize(
         "invalid_auth, expected_code, expected_message",
         [
